@@ -1244,6 +1244,82 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	json_t *merkle_arr;
 	unsigned char **merkle;
 
+	/* Debug: print what pool sends for mining.notify */
+	if (opt_debug || opt_protocol) {
+		char *dump = json_dumps(params, JSON_INDENT(2));
+		applog(LOG_DEBUG, "Stratum notify params: %s", dump);
+		free(dump);
+	}
+
+	/* Check if this is ZCash stratum format by looking at param count and structure */
+	/* ZCash: [job_id, version, prevhash, merkle_root, reserved, ntime, nbits, clean] */
+	/* Bitcoin: [job_id, prevhash, coinb1, coinb2, merkle[], version, nbits, ntime, clean] */
+	
+	size_t param_count = json_array_size(params);
+	json_t *param4 = json_array_get(params, 4);
+	
+	/* ZCash detection: param[4] is a string (reserved), not an array (merkle branches) */
+	if (param4 && json_is_string(param4)) {
+		/* ZCash stratum format */
+		const char *merkle_root, *reserved;
+		
+		job_id = json_string_value(json_array_get(params, 0));
+		version = json_string_value(json_array_get(params, 1));
+		prevhash = json_string_value(json_array_get(params, 2));
+		merkle_root = json_string_value(json_array_get(params, 3));
+		reserved = json_string_value(json_array_get(params, 4));
+		ntime = json_string_value(json_array_get(params, 5));
+		nbits = json_string_value(json_array_get(params, 6));
+		clean = json_is_true(json_array_get(params, 7));
+		
+		if (!job_id || !version || !prevhash || !ntime || !nbits) {
+			applog(LOG_ERR, "Stratum notify (ZCash): invalid parameters");
+			goto out;
+		}
+		
+		if (opt_debug) {
+			applog(LOG_DEBUG, "ZCash job: %s version=%s ntime=%s nbits=%s clean=%d",
+				job_id, version, ntime, nbits, clean);
+		}
+		
+		pthread_mutex_lock(&sctx->work_lock);
+		
+		free(sctx->job.job_id);
+		sctx->job.job_id = strdup(job_id);
+		
+		if (prevhash && strlen(prevhash) >= 64)
+			hex2bin(sctx->job.prevhash, prevhash, 32);
+		if (version && strlen(version) >= 8)
+			hex2bin(sctx->job.version, version, 4);
+		if (ntime && strlen(ntime) >= 8)
+			hex2bin(sctx->job.ntime, ntime, 4);
+		if (nbits && strlen(nbits) >= 8)
+			hex2bin(sctx->job.nbits, nbits, 4);
+		
+		/* For ZCash, we need to store the merkle_root and reserved for building header */
+		/* Store merkle_root in coinbase area for now */
+		if (merkle_root && strlen(merkle_root) >= 64) {
+			sctx->job.coinbase_size = 32;
+			sctx->job.coinbase = (unsigned char *)realloc(sctx->job.coinbase, 32);
+			hex2bin(sctx->job.coinbase, merkle_root, 32);
+		}
+		
+		/* Initialize xnonce2 for ZCash if not already done */
+		if (!sctx->job.xnonce2 && sctx->xnonce2_size > 0) {
+			sctx->job.xnonce2 = (unsigned char *)calloc(1, sctx->xnonce2_size);
+		}
+		
+		sctx->job.clean = clean;
+		sctx->job.diff = sctx->next_diff;
+		sctx->job.merkle_count = 0;
+		
+		pthread_mutex_unlock(&sctx->work_lock);
+		
+		ret = true;
+		goto out;
+	}
+	
+	/* Bitcoin stratum format (original code) */
 	job_id = json_string_value(json_array_get(params, 0));
 	prevhash = json_string_value(json_array_get(params, 1));
 	coinb1 = json_string_value(json_array_get(params, 2));

@@ -1097,17 +1097,29 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	work->job_id = strdup(sctx->job.job_id);
 	work->xnonce2_len = sctx->xnonce2_size;
 	work->xnonce2 = (unsigned char *)realloc(work->xnonce2, sctx->xnonce2_size);
-	memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
+	if (sctx->job.xnonce2)
+		memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
+	else
+		memset(work->xnonce2, 0, sctx->xnonce2_size);
 
-	/* Generate merkle root */
-	sha256d(merkle_root, sctx->job.coinbase, sctx->job.coinbase_size);
-	for (i = 0; i < sctx->job.merkle_count; i++) {
-		memcpy(merkle_root + 32, sctx->job.merkle[i], 32);
-		sha256d(merkle_root, merkle_root, 64);
+	/* Check if this is ZCash (merkle_count == 0 means pre-computed merkle_root in coinbase) */
+	if (sctx->job.merkle_count == 0 && sctx->job.coinbase_size == 32) {
+		/* ZCash: merkle_root is already in coinbase */
+		memcpy(merkle_root, sctx->job.coinbase, 32);
+		applog(LOG_DEBUG, "ZCash: using pre-computed merkle root");
+	} else {
+		/* Bitcoin: Generate merkle root from coinbase */
+		sha256d(merkle_root, sctx->job.coinbase, sctx->job.coinbase_size);
+		for (i = 0; i < sctx->job.merkle_count; i++) {
+			memcpy(merkle_root + 32, sctx->job.merkle[i], 32);
+			sha256d(merkle_root, merkle_root, 64);
+		}
 	}
 	
 	/* Increment extranonce2 */
-	for (i = 0; i < sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
+	if (sctx->job.xnonce2) {
+		for (i = 0; i < sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
+	}
 
 	/* Assemble block header */
 	memset(work->data, 0, 128);
