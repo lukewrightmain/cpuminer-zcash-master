@@ -1203,12 +1203,25 @@ bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *p
 		goto out;
 	}
 
+	/* Debug: print authorization response */
+	if (opt_debug || opt_protocol) {
+		char *dump = json_dumps(val, JSON_INDENT(2));
+		applog(LOG_DEBUG, "Stratum authorize response: %s", dump);
+		free(dump);
+	}
+
 	res_val = json_object_get(val, "result");
 	err_val = json_object_get(val, "error");
 
 	if (!res_val || json_is_false(res_val) ||
 	    (err_val && !json_is_null(err_val)))  {
-		applog(LOG_ERR, "Stratum authentication failed");
+		if (err_val && !json_is_null(err_val)) {
+			char *err_str = json_dumps(err_val, 0);
+			applog(LOG_ERR, "Stratum authentication failed: %s", err_str);
+			free(err_str);
+		} else {
+			applog(LOG_ERR, "Stratum authentication failed");
+		}
 		goto out;
 	}
 
