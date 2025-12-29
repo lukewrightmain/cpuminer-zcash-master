@@ -300,6 +300,11 @@ struct work {
 	char *job_id;
 	size_t xnonce2_len;
 	unsigned char *xnonce2;
+	
+	/* ZCash Equihash solution (1344 bytes for 200,9) */
+	unsigned char solution[1344];
+	size_t solution_len;
+	bool has_solution;
 };
 
 static struct work g_work;
@@ -357,6 +362,10 @@ static bool work_decode(const json_t *val, struct work *work)
 {
 	int i;
 
+	/* Initialize solution fields */
+	work->has_solution = false;
+	work->solution_len = 0;
+
 	if (unlikely(!jobj_binary(val, "data", work->data, sizeof(work->data)))) {
 		applog(LOG_ERR, "JSON invalid data");
 		goto err_out;
@@ -397,6 +406,10 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 	bool version_reduce = false;
 	json_t *tmp, *txa;
 	bool rc = false;
+
+	/* Initialize solution fields */
+	work->has_solution = false;
+	work->solution_len = 0;
 
 	tmp = json_object_get(val, "mutable");
 	if (tmp && json_is_array(tmp)) {
@@ -696,16 +709,37 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	if (have_stratum) {
 		uint32_t ntime, nonce;
 		char ntimestr[9], noncestr[9], *xnonce2str, *req;
+		char *solutionstr = NULL;
 
 		le32enc(&ntime, work->data[17]);
 		le32enc(&nonce, work->data[19]);
 		bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
 		bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
 		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-		req = (char *)malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 2 * work->xnonce2_len);
-		sprintf(req,
-			"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
-			rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
+		
+		/* ZCash stratum requires the solution */
+		if (opt_algo == ALGO_EQUIHASH && work->has_solution && work->solution_len > 0) {
+			solutionstr = abin2hex(work->solution, work->solution_len);
+			
+			/* ZCash stratum format: ["user", "job_id", "ntime", "nonce", "solution"] */
+			req = (char *)malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 
+				2 * work->xnonce2_len + 2 * work->solution_len);
+			sprintf(req,
+				"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s%s\", \"%s\"], \"id\":4}",
+				rpc_user, work->job_id, ntimestr, xnonce2str, noncestr, solutionstr);
+			
+			if (opt_debug) {
+				applog(LOG_DEBUG, "Submitting ZCash solution: job=%s ntime=%s nonce=%s%s solution=%zu bytes",
+					work->job_id, ntimestr, xnonce2str, noncestr, work->solution_len);
+			}
+			free(solutionstr);
+		} else {
+			/* Original Bitcoin-style stratum format */
+			req = (char *)malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 2 * work->xnonce2_len);
+			sprintf(req,
+				"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
+				rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
+		}
 		free(xnonce2str);
 
 		rc = stratum_send_line(&stratum, req);
@@ -1044,6 +1078,11 @@ err_out:
 	return false;
 }
 
+/* Thread-local storage for Equihash solutions */
+static unsigned char g_solutions[256][1344];  /* Max 256 threads, 1344 bytes per solution */
+static size_t g_solution_len[256];
+static bool g_has_solution[256];
+
 /* ZCash Equihash mining function */
 int scanhash_equihash(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	uint32_t max_nonce, unsigned long *hashes_done)
@@ -1053,9 +1092,10 @@ int scanhash_equihash(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	const unsigned int K = 9;
 	
 	unsigned char header[140];
-	unsigned char hash[32];
 	uint32_t nonce = pdata[19];
 	int rc = 0;
+	
+	g_has_solution[thr_id] = false;
 	
 	/* Build the header (first 140 bytes for ZCash) */
 	for (int i = 0; i < 32; i++) {
@@ -1079,16 +1119,14 @@ int scanhash_equihash(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 		try {
 			found = EhOptimisedSolve(N, K, state,
 				[&](std::vector<unsigned char> soln) -> bool {
-					/* Verify the solution meets the target */
-					/* For now, accept any valid solution and let the pool validate */
-					(*hashes_done)++;
-					
-					/* Store solution back into pdata if needed */
-					/* The actual solution handling depends on stratum protocol */
-					
-					if (opt_debug) {
-						applog(LOG_DEBUG, "Thread %d found potential solution at nonce %u", 
-							thr_id, nonce);
+					/* Store the solution! */
+					if (soln.size() <= 1344) {
+						memcpy(g_solutions[thr_id], soln.data(), soln.size());
+						g_solution_len[thr_id] = soln.size();
+						g_has_solution[thr_id] = true;
+						
+						applog(LOG_INFO, C_BRIGHT_GREEN "💎 Thread %d found solution!" C_RESET " (nonce=%08x, %zu bytes)", 
+							thr_id, nonce, soln.size());
 					}
 					
 					/* Return true to stop solving, we found one */
@@ -1104,7 +1142,7 @@ int scanhash_equihash(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 			break;
 		}
 		
-		if (found) {
+		if (found && g_has_solution[thr_id]) {
 			pdata[19] = nonce;
 			rc = 1;
 			break;
@@ -1160,6 +1198,8 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
 	/* Assemble block header */
 	memset(work->data, 0, 128);
+	work->has_solution = false;  /* Reset solution state for new work */
+	work->solution_len = 0;
 	work->data[0] = le32dec(sctx->job.version);
 	for (i = 0; i < 8; i++)
 		work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
@@ -1324,8 +1364,17 @@ static void *miner_thread(void *userdata)
 		}
 
 		/* if nonce found, submit work */
-		if (rc && !opt_benchmark && !submit_work(mythr, &work))
-			break;
+		if (rc && !opt_benchmark) {
+			/* Copy solution from thread-local storage to work struct */
+			if (g_has_solution[thr_id]) {
+				memcpy(work.solution, g_solutions[thr_id], g_solution_len[thr_id]);
+				work.solution_len = g_solution_len[thr_id];
+				work.has_solution = true;
+				g_has_solution[thr_id] = false;
+			}
+			if (!submit_work(mythr, &work))
+				break;
+		}
 	}
 
 out:
