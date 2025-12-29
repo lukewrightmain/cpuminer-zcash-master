@@ -44,6 +44,42 @@
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
 
+/* ANSI Color codes for colorful output */
+#define C_RESET   "\033[0m"
+#define C_BOLD    "\033[1m"
+#define C_RED     "\033[31m"
+#define C_GREEN   "\033[32m"
+#define C_YELLOW  "\033[33m"
+#define C_BLUE    "\033[34m"
+#define C_MAGENTA "\033[35m"
+#define C_CYAN    "\033[36m"
+#define C_WHITE   "\033[37m"
+#define C_BRIGHT_GREEN  "\033[92m"
+#define C_BRIGHT_CYAN   "\033[96m"
+#define C_BRIGHT_YELLOW "\033[93m"
+#define C_BRIGHT_MAGENTA "\033[95m"
+#define C_BRIGHT_BLUE   "\033[94m"
+#define C_BG_BLUE  "\033[44m"
+
+static void print_banner(void)
+{
+	fprintf(stderr, "\n");
+	fprintf(stderr, C_BRIGHT_CYAN C_BOLD);
+	fprintf(stderr, "   ╔═══════════════════════════════════════════════════════════╗\n");
+	fprintf(stderr, "   ║" C_RESET C_BRIGHT_BLUE "  ░█▀▀░█▀▀░█░░░█░░░█░█░█▀█░█▀▀░█░█░█▀▀░█▀▄  " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ║" C_RESET C_BRIGHT_CYAN "  ░█░░░█▀▀░█░░░█░░░█▀█░█▀█░▀▀█░█▀█░█▀▀░█▀▄  " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ║" C_RESET C_CYAN "  ░▀▀▀░▀▀▀░▀▀▀░▀▀▀░▀░▀░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀  " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ║                                                           ║\n");
+	fprintf(stderr, "   ║" C_RESET C_BRIGHT_YELLOW "              ⚡ " C_BOLD "Cellhasher" C_RESET C_WHITE " x " C_BRIGHT_YELLOW C_BOLD "ZEC" C_RESET C_BRIGHT_YELLOW " ⚡                  " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ║" C_RESET C_WHITE "                Mobile Mining Power!                    " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ╠═══════════════════════════════════════════════════════════╣\n");
+	fprintf(stderr, "   ║" C_RESET C_BRIGHT_GREEN "  💎 Algorithm: " C_WHITE "Equihash (200,9)                        " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ║" C_RESET C_BRIGHT_MAGENTA "  📱 Optimized for Android/Termux                       " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ║" C_RESET C_BRIGHT_YELLOW "  🚀 Let's mine some ZCash!                              " C_BRIGHT_CYAN C_BOLD "║\n");
+	fprintf(stderr, "   ╚═══════════════════════════════════════════════════════════╝\n");
+	fprintf(stderr, C_RESET "\n");
+}
+
 #ifdef __linux /* Linux specific policy and affinity management */
 #include <sched.h>
 static inline void drop_policy(void)
@@ -630,12 +666,13 @@ static void share_result(int result, const char *reason)
 	pthread_mutex_unlock(&stats_lock);
 	
 	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s khash/s %s",
+	applog(LOG_NOTICE, "%s " C_BRIGHT_GREEN "Share %s!" C_RESET " [" C_BRIGHT_CYAN "%lu" C_RESET "/" C_CYAN "%lu" C_RESET "] " C_BRIGHT_YELLOW "%.1f%%" C_RESET " @ " C_BRIGHT_MAGENTA "%s kH/s" C_RESET,
+		   result ? "✓" : "✗",
+		   result ? "accepted" : "rejected",
 		   accepted_count,
 		   accepted_count + rejected_count,
 		   100. * accepted_count / (accepted_count + rejected_count),
-		   s,
-		   result ? "(yay!!!)" : "(booooo)");
+		   s);
 
 	if (opt_debug && reason)
 		applog(LOG_DEBUG, "DEBUG: reject reason: %s", reason);
@@ -861,7 +898,7 @@ static bool workio_get_work(struct workio_cmd *wc, CURL *curl)
 		}
 
 		/* pause, then restart work-request loop */
-		applog(LOG_ERR, "json_rpc_call failed, retry after %d seconds",
+		applog(LOG_WARNING, C_YELLOW "⏳ Connection failed, retrying in %d seconds..." C_RESET,
 			opt_fail_pause);
 		sleep(opt_fail_pause);
 	}
@@ -885,7 +922,7 @@ static bool workio_submit_work(struct workio_cmd *wc, CURL *curl)
 		}
 
 		/* pause, then restart work-request loop */
-		applog(LOG_ERR, "...retry after %d seconds",
+		applog(LOG_WARNING, C_YELLOW "⏳ Retrying in %d seconds..." C_RESET,
 			opt_fail_pause);
 		sleep(opt_fail_pause);
 	}
@@ -1170,9 +1207,8 @@ static void *miner_thread(void *userdata)
 	/* Cpu affinity only makes sense if the number of threads is a multiple
 	 * of the number of CPUs */
 	if (num_processors > 1 && opt_n_threads % num_processors == 0) {
-		if (!opt_quiet)
-			applog(LOG_INFO, "Binding thread %d to cpu %d",
-			       thr_id, thr_id % num_processors);
+		if (!opt_quiet && opt_debug)
+			applog(LOG_DEBUG, C_CYAN "  ⚙ Thread %d" C_RESET " → CPU %d", thr_id, thr_id % num_processors);
 		affine_to_cpu(thr_id, thr_id % num_processors);
 	}
 	
@@ -1274,8 +1310,8 @@ static void *miner_thread(void *userdata)
 		if (!opt_quiet) {
 			sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.2f",
 				1e-3 * thr_hashrates[thr_id]);
-			applog(LOG_INFO, "thread %d: %lu hashes, %s khash/s",
-				thr_id, hashes_done, s);
+			applog(LOG_INFO, C_CYAN "⛏  CPU%d" C_RESET " │ " C_BRIGHT_MAGENTA "%s kH/s" C_RESET " │ " C_WHITE "%lu" C_RESET " hashes",
+				thr_id, s, hashes_done);
 		}
 		if (opt_benchmark && thr_id == opt_n_threads - 1) {
 			double hashrate = 0.;
@@ -1283,7 +1319,7 @@ static void *miner_thread(void *userdata)
 				hashrate += thr_hashrates[i];
 			if (i == opt_n_threads) {
 				sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-				applog(LOG_INFO, "Total: %s khash/s", s);
+				applog(LOG_NOTICE, C_BRIGHT_YELLOW "⚡ TOTAL" C_RESET " │ " C_BRIGHT_GREEN C_BOLD "%s kH/s" C_RESET " │ " C_WHITE "All threads" C_RESET, s);
 			}
 		}
 
@@ -1447,7 +1483,7 @@ static void *stratum_thread(void *userdata)
 	stratum.url = (char *)tq_pop(mythr->q, NULL);
 	if (!stratum.url)
 		goto out;
-	applog(LOG_INFO, "Starting Stratum on %s", stratum.url);
+	applog(LOG_NOTICE, C_BRIGHT_CYAN "🌐 Connecting to pool:" C_RESET " %s", stratum.url);
 
 	while (1) {
 		int failures = 0;
@@ -1467,8 +1503,8 @@ static void *stratum_thread(void *userdata)
 					tq_push(thr_info[work_thr_id].q, NULL);
 					goto out;
 				}
-				applog(LOG_ERR, "...retry after %d seconds", opt_fail_pause);
-				sleep(opt_fail_pause);
+			applog(LOG_WARNING, C_YELLOW "⏳ Reconnecting in %d seconds..." C_RESET, opt_fail_pause);
+			sleep(opt_fail_pause);
 			}
 		}
 
@@ -1479,7 +1515,7 @@ static void *stratum_thread(void *userdata)
 			time(&g_work_time);
 			pthread_mutex_unlock(&g_work_lock);
 			if (stratum.job.clean) {
-				applog(LOG_INFO, "Stratum requested work restart");
+				applog(LOG_INFO, C_BRIGHT_CYAN "📥 New job received!" C_RESET);
 				restart_threads();
 			}
 		}
@@ -1869,6 +1905,9 @@ int main(int argc, char *argv[])
 	long flags;
 	int i;
 
+	/* Show the awesome banner! */
+	print_banner();
+
 	rpc_user = strdup("");
 	rpc_pass = strdup("");
 
@@ -2017,14 +2056,14 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	applog(LOG_INFO, "%d miner threads started, "
-		"using algorithm.",
+	applog(LOG_NOTICE, C_BRIGHT_GREEN "🚀 MINING STARTED!" C_RESET " " C_BRIGHT_CYAN "%d" C_RESET " threads | " C_BRIGHT_YELLOW "Equihash (200,9)" C_RESET,
 		opt_n_threads);
+	fprintf(stderr, C_CYAN "   ───────────────────────────────────────────────────────────\n" C_RESET);
 
 	/* main loop - simply wait for workio thread to exit */
 	pthread_join(thr_info[work_thr_id].pth, NULL);
 
-	applog(LOG_INFO, "workio thread dead, exiting.");
+	applog(LOG_WARNING, "👋 Mining stopped. See you next time!");
 
 	return 0;
 }

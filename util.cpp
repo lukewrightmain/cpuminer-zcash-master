@@ -68,6 +68,21 @@ struct thread_q {
 	pthread_cond_t		cond;
 };
 
+/* ANSI Color codes for terminal output */
+#define CLR_RESET   "\033[0m"
+#define CLR_BOLD    "\033[1m"
+#define CLR_RED     "\033[31m"
+#define CLR_GREEN   "\033[32m"
+#define CLR_YELLOW  "\033[33m"
+#define CLR_BLUE    "\033[34m"
+#define CLR_MAGENTA "\033[35m"
+#define CLR_CYAN    "\033[36m"
+#define CLR_WHITE   "\033[37m"
+#define CLR_BRIGHT_GREEN  "\033[92m"
+#define CLR_BRIGHT_CYAN   "\033[96m"
+#define CLR_BRIGHT_YELLOW "\033[93m"
+#define CLR_BRIGHT_MAGENTA "\033[95m"
+
 void applog(int prio, const char *fmt, ...)
 {
 	va_list ap;
@@ -95,6 +110,9 @@ void applog(int prio, const char *fmt, ...)
 		int len;
 		time_t now;
 		struct tm tm, *tm_p;
+		const char *color_start = "";
+		const char *color_end = CLR_RESET;
+		const char *icon = "";
 
 		time(&now);
 
@@ -103,18 +121,49 @@ void applog(int prio, const char *fmt, ...)
 		memcpy(&tm, tm_p, sizeof(tm));
 		pthread_mutex_unlock(&applog_lock);
 
-		len = 40 + strlen(fmt) + 2;
+		/* Set colors and icons based on priority/content */
+		switch (prio) {
+		case LOG_ERR:
+			color_start = CLR_RED CLR_BOLD;
+			icon = "✗ ";
+			break;
+		case LOG_WARNING:
+			color_start = CLR_YELLOW;
+			icon = "⚠ ";
+			break;
+		case LOG_NOTICE:
+			color_start = CLR_BRIGHT_CYAN;
+			icon = "★ ";
+			break;
+		case LOG_INFO:
+			color_start = CLR_BRIGHT_GREEN;
+			icon = "⚡";
+			break;
+		case LOG_DEBUG:
+			color_start = CLR_MAGENTA;
+			icon = "⚙ ";
+			break;
+		default:
+			color_start = CLR_WHITE;
+			icon = "";
+			break;
+		}
+
+		len = 80 + strlen(fmt) + 2;
 		f = (char *)alloca(len);
-		sprintf(f, "[%d-%02d-%02d %02d:%02d:%02d] %s\n",
-			tm.tm_year + 1900,
-			tm.tm_mon + 1,
-			tm.tm_mday,
+		sprintf(f, "%s[%s%02d:%02d:%02d%s] %s%s%s\n",
+			CLR_CYAN,
+			CLR_WHITE,
 			tm.tm_hour,
 			tm.tm_min,
 			tm.tm_sec,
+			CLR_CYAN,
+			color_start,
+			icon,
 			fmt);
 		pthread_mutex_lock(&applog_lock);
-		vfprintf(stderr, f, ap);	/* atomic write to stderr */
+		vfprintf(stderr, f, ap);
+		fprintf(stderr, "%s", color_end);
 		fflush(stderr);
 		pthread_mutex_unlock(&applog_lock);
 	}
@@ -1156,6 +1205,7 @@ start:
 	if (opt_debug && sid)
 		applog(LOG_DEBUG, "Stratum session id: %s", sctx->session_id);
 
+	applog(LOG_NOTICE, CLR_BRIGHT_GREEN "✓ Subscribed!" CLR_RESET " " CLR_WHITE "Pool connection established" CLR_RESET);
 	ret = true;
 
 out:
@@ -1217,14 +1267,15 @@ bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *p
 	    (err_val && !json_is_null(err_val)))  {
 		if (err_val && !json_is_null(err_val)) {
 			char *err_str = json_dumps(err_val, 0);
-			applog(LOG_ERR, "Stratum authentication failed: %s", err_str);
+			applog(LOG_ERR, CLR_RED "✗ Authentication failed:" CLR_RESET " %s", err_str);
 			free(err_str);
 		} else {
-			applog(LOG_ERR, "Stratum authentication failed");
+			applog(LOG_ERR, CLR_RED "✗ Authentication failed" CLR_RESET);
 		}
 		goto out;
 	}
 
+	applog(LOG_NOTICE, CLR_BRIGHT_GREEN "✓ Authorized!" CLR_RESET " " CLR_WHITE "Worker connected successfully" CLR_RESET);
 	ret = true;
 
 out:
