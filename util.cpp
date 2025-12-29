@@ -1080,6 +1080,13 @@ start:
 	res_val = json_object_get(val, "result");
 	err_val = json_object_get(val, "error");
 
+	/* Debug: print what pool returned */
+	if (opt_debug || opt_protocol) {
+		char *dump = json_dumps(val, JSON_INDENT(2));
+		applog(LOG_DEBUG, "Stratum subscribe response: %s", dump);
+		free(dump);
+	}
+
 	if (!res_val || json_is_null(res_val) ||
 	    (err_val && !json_is_null(err_val))) {
 		if (opt_debug || retry) {
@@ -1096,15 +1103,39 @@ start:
 	sid = get_stratum_session_id(res_val);
 	if (opt_debug && !sid)
 		applog(LOG_DEBUG, "Failed to get Stratum session id");
+	
+	/* Try ZCash stratum format first: [null/session, nonce1_hex] */
+	/* Then fall back to Bitcoin format: [[subscription], nonce1_hex, nonce2_size] */
 	xnonce1 = json_string_value(json_array_get(res_val, 1));
+	if (!xnonce1) {
+		/* Try getting nonce1 from position 0 for some ZCash pools */
+		xnonce1 = json_string_value(json_array_get(res_val, 0));
+	}
 	if (!xnonce1) {
 		applog(LOG_ERR, "Failed to get extranonce1");
 		goto out;
 	}
+	
 	xn2_size = json_integer_value(json_array_get(res_val, 2));
 	if (!xn2_size) {
-		applog(LOG_ERR, "Failed to get extranonce2_size");
-		goto out;
+		/* ZCash stratum: extranonce2_size is typically not provided
+		 * Calculate it based on nonce1 length.
+		 * ZCash uses 32-byte (256-bit) nonce total.
+		 * nonce1 is provided by pool, remaining is nonce2.
+		 * Standard: nonce1 is ~4 bytes, nonce2 is up to 28 bytes
+		 * But we typically use a smaller nonce2 for compatibility */
+		size_t nonce1_len = strlen(xnonce1) / 2;
+		if (nonce1_len > 0 && nonce1_len < 32) {
+			/* For ZCash Equihash, use remaining space up to a reasonable size */
+			xn2_size = 32 - nonce1_len;
+			if (xn2_size > 8) xn2_size = 8; /* Cap at 8 bytes for compatibility */
+			applog(LOG_DEBUG, "ZCash stratum: derived extranonce2_size = %d (nonce1 = %zu bytes)", 
+				xn2_size, nonce1_len);
+		} else {
+			/* Default fallback for ZCash */
+			xn2_size = 4;
+			applog(LOG_DEBUG, "ZCash stratum: using default extranonce2_size = %d", xn2_size);
+		}
 	}
 	if (xn2_size < 0 || xn2_size > 100) {
 		applog(LOG_ERR, "Invalid value of extranonce2_size");
