@@ -20,6 +20,38 @@
 #include <stdexcept>
 #include <optional>
 
+// Endian conversion compatibility for Android/Bionic
+#ifdef __ANDROID__
+#include <sys/endian.h>
+#else
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+#define htole32(x) OSSwapHostToLittleInt32(x)
+#define htobe32(x) OSSwapHostToBigInt32(x)
+#define be32toh(x) OSSwapBigToHostInt32(x)
+#elif defined(__linux__)
+#include <endian.h>
+#elif defined(_WIN32)
+#include <winsock2.h>
+#define htole32(x) (x)
+#define htobe32(x) htonl(x)
+#define be32toh(x) ntohl(x)
+#endif
+#endif
+
+// Fallback definitions if not provided
+#ifndef htole32
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define htole32(x) (x)
+#define htobe32(x) __builtin_bswap32(x)
+#define be32toh(x) __builtin_bswap32(x)
+#else
+#define htole32(x) __builtin_bswap32(x)
+#define htobe32(x) (x)
+#define be32toh(x) (x)
+#endif
+#endif
+
 EhSolverCancelledException solver_cancelled;
 
 template<unsigned int N, unsigned int K>
