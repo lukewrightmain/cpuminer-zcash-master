@@ -718,7 +718,14 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
 		
 		/* ZCash stratum requires the solution */
-		if (opt_algo == ALGO_EQUIHASH && work->has_solution && work->solution_len > 0) {
+		if (opt_algo == ALGO_EQUIHASH) {
+			if (!work->has_solution || work->solution_len == 0) {
+				applog(LOG_ERR, C_RED "✗ Cannot submit: no solution attached!" C_RESET 
+					" (has_solution=%d, len=%zu)", work->has_solution, work->solution_len);
+				free(xnonce2str);
+				goto out;
+			}
+			
 			solutionstr = abin2hex(work->solution, work->solution_len);
 			
 			/* ZCash stratum format: ["user", "job_id", "ntime", "nonce", "solution"] */
@@ -728,10 +735,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 				"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s%s\", \"%s\"], \"id\":4}",
 				rpc_user, work->job_id, ntimestr, xnonce2str, noncestr, solutionstr);
 			
-			if (opt_debug) {
-				applog(LOG_DEBUG, "Submitting ZCash solution: job=%s ntime=%s nonce=%s%s solution=%zu bytes",
-					work->job_id, ntimestr, xnonce2str, noncestr, work->solution_len);
-			}
+			applog(LOG_NOTICE, C_BRIGHT_CYAN "📤 Submitting share:" C_RESET " job=%s nonce=%s%s solution=%zu bytes",
+				work->job_id, xnonce2str, noncestr, work->solution_len);
 			free(solutionstr);
 		} else {
 			/* Original Bitcoin-style stratum format */
@@ -1365,15 +1370,23 @@ static void *miner_thread(void *userdata)
 
 		/* if nonce found, submit work */
 		if (rc && !opt_benchmark) {
-			/* Copy solution from thread-local storage to work struct */
-			if (g_has_solution[thr_id]) {
-				memcpy(work.solution, g_solutions[thr_id], g_solution_len[thr_id]);
-				work.solution_len = g_solution_len[thr_id];
-				work.has_solution = true;
-				g_has_solution[thr_id] = false;
+			/* For Equihash, only submit if we have a valid solution */
+			if (opt_algo == ALGO_EQUIHASH) {
+				if (g_has_solution[thr_id]) {
+					memcpy(work.solution, g_solutions[thr_id], g_solution_len[thr_id]);
+					work.solution_len = g_solution_len[thr_id];
+					work.has_solution = true;
+					g_has_solution[thr_id] = false;
+					
+					if (!submit_work(mythr, &work))
+						break;
+				}
+				/* If no solution, don't submit - just continue mining */
+			} else {
+				/* Other algorithms (SHA256D, etc) */
+				if (!submit_work(mythr, &work))
+					break;
 			}
-			if (!submit_work(mythr, &work))
-				break;
 		}
 	}
 
