@@ -728,15 +728,18 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 			
 			solutionstr = abin2hex(work->solution, work->solution_len);
 			
-			/* ZCash stratum format: ["user", "job_id", "ntime", "nonce", "solution"] */
+			/* ZCash stratum format: ["worker", "job_id", "ntime", "extranonce2", "solution"] 
+			 * Note: For Equihash, the solution is the proof-of-work, not an iterated nonce.
+			 * We only send extranonce2 as the "nonce" field, not xnonce2+solving_nonce.
+			 */
 			req = (char *)malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 
 				2 * work->xnonce2_len + 2 * work->solution_len);
 			sprintf(req,
-				"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s%s\", \"%s\"], \"id\":4}",
-				rpc_user, work->job_id, ntimestr, xnonce2str, noncestr, solutionstr);
+				"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
+				rpc_user, work->job_id, ntimestr, xnonce2str, solutionstr);
 			
-			applog(LOG_NOTICE, C_BRIGHT_CYAN "📤 Submitting share:" C_RESET " job=%s nonce=%s%s solution=%zu bytes",
-				work->job_id, xnonce2str, noncestr, work->solution_len);
+			applog(LOG_NOTICE, C_BRIGHT_CYAN "📤 Submitting share:" C_RESET " job=%s ntime=%s xnonce2=%s solution=%zu bytes",
+				work->job_id, ntimestr, xnonce2str, work->solution_len);
 			free(solutionstr);
 		} else {
 			/* Original Bitcoin-style stratum format */
