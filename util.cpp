@@ -1347,12 +1347,15 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 		if (nbits && strlen(nbits) >= 8)
 			hex2bin(sctx->job.nbits, nbits, 4);
 		
-		/* For ZCash, we need to store the merkle_root and reserved for building header */
-		/* Store merkle_root in coinbase area for now */
+		/* Store ZCash-specific fields */
 		if (merkle_root && strlen(merkle_root) >= 64) {
-			sctx->job.coinbase_size = 32;
-			sctx->job.coinbase = (unsigned char *)realloc(sctx->job.coinbase, 32);
-			hex2bin(sctx->job.coinbase, merkle_root, 32);
+			hex2bin(sctx->job.merkle_root, merkle_root, 32);
+		}
+		
+		if (reserved && strlen(reserved) >= 64) {
+			hex2bin(sctx->job.reserved, reserved, 32);
+		} else {
+			memset(sctx->job.reserved, 0, 32);
 		}
 		
 		/* Initialize xnonce2 for ZCash if not already done */
@@ -1360,9 +1363,11 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 			sctx->job.xnonce2 = (unsigned char *)calloc(1, sctx->xnonce2_size);
 		}
 		
+		sctx->job.is_zcash = true;
 		sctx->job.clean = clean;
 		sctx->job.diff = sctx->next_diff;
 		sctx->job.merkle_count = 0;
+		sctx->job.coinbase_size = 0; /* Not used for ZCash */
 		
 		pthread_mutex_unlock(&sctx->work_lock);
 		
@@ -1432,6 +1437,7 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	hex2bin(sctx->job.nbits, nbits, 4);
 	hex2bin(sctx->job.ntime, ntime, 4);
 	sctx->job.clean = clean;
+	sctx->job.is_zcash = false;  /* Bitcoin stratum format */
 
 	sctx->job.diff = sctx->next_diff;
 

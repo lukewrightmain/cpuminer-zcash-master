@@ -1100,72 +1100,72 @@ int scanhash_equihash(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 	const unsigned int K = 9;
 	
 	unsigned char header[140];
-	uint32_t nonce = pdata[19];
 	int rc = 0;
 	
 	g_has_solution[thr_id] = false;
 	
-	/* Build the header (first 140 bytes for ZCash) */
-	for (int i = 0; i < 32; i++) {
+	/* Build the 140-byte header from work->data
+	 * The header is already prepared by stratum_gen_work with the correct
+	 * nonce1 + extranonce2 in the nonce field (bytes 108-139)
+	 */
+	for (int i = 0; i < 35; i++) {
 		le32enc((uint32_t *)(header + i*4), pdata[i]);
 	}
 	
-	while (nonce <= max_nonce && !work_restart[thr_id].restart) {
-		/* Set nonce in header */
-		le32enc((uint32_t *)(header + 76), nonce);
-		
-		/* Initialize Equihash state */
-		eh_HashState state;
-		EhInitialiseState(N, K, state);
-		
-		/* Update state with header (first 140 bytes minus solution space) */
-		crypto_generichash_blake2b_update(&state, header, 140);
-		
-		/* Try to find a solution */
-		bool found = false;
-		
-		try {
-			found = EhOptimisedSolve(N, K, state,
-				[&](std::vector<unsigned char> soln) -> bool {
-					/* Store the solution! */
-					if (soln.size() <= 1344) {
-						memcpy(g_solutions[thr_id], soln.data(), soln.size());
-						g_solution_len[thr_id] = soln.size();
-						g_has_solution[thr_id] = true;
-						
-						applog(LOG_INFO, C_BRIGHT_GREEN "💎 Thread %d found solution!" C_RESET " (nonce=%08x, %zu bytes)", 
-							thr_id, nonce, soln.size());
-					}
+	if (work_restart[thr_id].restart)
+		return 0;
+	
+	/* Initialize Equihash state */
+	eh_HashState state;
+	EhInitialiseState(N, K, state);
+	
+	/* Update state with first 140 bytes of header
+	 * Note: For Equihash, we hash the ENTIRE 140 byte header including nonce
+	 */
+	crypto_generichash_blake2b_update(&state, header, 140);
+	
+	/* Try to find a solution */
+	bool found = false;
+	
+	try {
+		found = EhOptimisedSolve(N, K, state,
+			[&](std::vector<unsigned char> soln) -> bool {
+				/* We found a valid Equihash solution!
+				 * For pool mining, we accept any valid solution - the pool
+				 * will verify if it meets the difficulty target.
+				 */
+				if (soln.size() <= 1344) {
+					memcpy(g_solutions[thr_id], soln.data(), soln.size());
+					g_solution_len[thr_id] = soln.size();
+					g_has_solution[thr_id] = true;
 					
-					/* Return true to stop solving, we found one */
-					return true;
-				},
-				[&](EhSolverCancelCheck pos) -> bool {
-					/* Check if we should cancel */
-					return work_restart[thr_id].restart != 0;
+					applog(LOG_NOTICE, C_BRIGHT_GREEN "💎 Thread %d found solution!" C_RESET " (%zu bytes)", 
+						thr_id, soln.size());
 				}
-			);
-		} catch (EhSolverCancelledException&) {
-			/* Solver was cancelled, break out */
-			break;
-		}
-		
-		if (found && g_has_solution[thr_id]) {
-			pdata[19] = nonce;
-			rc = 1;
-			break;
-		}
-		
-		nonce++;
-		(*hashes_done)++;
-		
-		/* Limit iterations per call */
-		if ((*hashes_done) >= 1) {
-			break; /* Equihash is slow, return after each attempt */
-		}
+				
+				/* Return true to stop solving, we found one */
+				return true;
+			},
+			[&](EhSolverCancelCheck pos) -> bool {
+				/* Check if we should cancel */
+				return work_restart[thr_id].restart != 0;
+			}
+		);
+	} catch (EhSolverCancelledException&) {
+		/* Solver was cancelled */
+		found = false;
+	} catch (std::exception& e) {
+		applog(LOG_ERR, "Thread %d Equihash exception: %s", thr_id, e.what());
+		found = false;
 	}
 	
-	pdata[19] = nonce;
+	/* Count as one hash attempt (Equihash does many internal iterations) */
+	(*hashes_done)++;
+	
+	if (found && g_has_solution[thr_id]) {
+		rc = 1;
+	}
+	
 	return rc;
 }
 
@@ -1184,12 +1184,65 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
 	else
 		memset(work->xnonce2, 0, sctx->xnonce2_size);
+	
+	/* Increment extranonce2 */
+	if (sctx->job.xnonce2) {
+		for (i = 0; i < (int)sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
+	}
 
-	/* Check if this is ZCash (merkle_count == 0 means pre-computed merkle_root in coinbase) */
-	if (sctx->job.merkle_count == 0 && sctx->job.coinbase_size == 32) {
-		/* ZCash: merkle_root is already in coinbase */
-		memcpy(merkle_root, sctx->job.coinbase, 32);
-		applog(LOG_DEBUG, "ZCash: using pre-computed merkle root");
+	/* Reset solution state for new work */
+	work->has_solution = false;
+	work->solution_len = 0;
+
+	if (sctx->job.is_zcash) {
+		/* ZCash 140-byte block header format:
+		 * Version:        4 bytes  (offset 0)
+		 * hashPrevBlock:  32 bytes (offset 4)
+		 * hashMerkleRoot: 32 bytes (offset 36)
+		 * hashReserved:   32 bytes (offset 68)
+		 * nTime:          4 bytes  (offset 100)
+		 * nBits:          4 bytes  (offset 104)
+		 * nNonce:         32 bytes (offset 108) = nonce1 + extranonce2 + padding
+		 * Total:          140 bytes
+		 */
+		unsigned char header[140];
+		memset(header, 0, sizeof(header));
+		
+		/* Version at offset 0 */
+		memcpy(header + 0, sctx->job.version, 4);
+		
+		/* hashPrevBlock at offset 4 */
+		memcpy(header + 4, sctx->job.prevhash, 32);
+		
+		/* hashMerkleRoot at offset 36 */
+		memcpy(header + 36, sctx->job.merkle_root, 32);
+		
+		/* hashReserved at offset 68 */
+		memcpy(header + 68, sctx->job.reserved, 32);
+		
+		/* nTime at offset 100 */
+		memcpy(header + 100, sctx->job.ntime, 4);
+		
+		/* nBits at offset 104 */
+		memcpy(header + 104, sctx->job.nbits, 4);
+		
+		/* nNonce at offset 108 (32 bytes):
+		 * - nonce1 from pool (typically 4 bytes)
+		 * - extranonce2 from us (typically 8 bytes)
+		 * - remaining zeros
+		 */
+		if (sctx->xnonce1 && sctx->xnonce1_size > 0)
+			memcpy(header + 108, sctx->xnonce1, sctx->xnonce1_size);
+		if (sctx->job.xnonce2 && sctx->xnonce2_size > 0)
+			memcpy(header + 108 + sctx->xnonce1_size, sctx->job.xnonce2, sctx->xnonce2_size);
+		
+		/* Copy 140-byte header into work->data (as 35 uint32_t values) */
+		memset(work->data, 0, sizeof(work->data));
+		for (i = 0; i < 35; i++) {
+			work->data[i] = le32dec((uint32_t *)(header + i * 4));
+		}
+		
+		applog(LOG_DEBUG, "ZCash: built 140-byte header");
 	} else {
 		/* Bitcoin: Generate merkle root from coinbase */
 		sha256d(merkle_root, sctx->job.coinbase, sctx->job.coinbase_size);
@@ -1197,38 +1250,31 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			memcpy(merkle_root + 32, sctx->job.merkle[i], 32);
 			sha256d(merkle_root, merkle_root, 64);
 		}
-	}
-	
-	/* Increment extranonce2 */
-	if (sctx->job.xnonce2) {
-		for (i = 0; i < sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
-	}
 
-	/* Assemble block header */
-	memset(work->data, 0, 128);
-	work->has_solution = false;  /* Reset solution state for new work */
-	work->solution_len = 0;
-	work->data[0] = le32dec(sctx->job.version);
-	for (i = 0; i < 8; i++)
-		work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
-	for (i = 0; i < 8; i++)
-		work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
-	work->data[17] = le32dec(sctx->job.ntime);
-	work->data[18] = le32dec(sctx->job.nbits);
-	work->data[20] = 0x80000000;
-	work->data[31] = 0x00000280;
+		/* Bitcoin block header */
+		memset(work->data, 0, 128);
+		work->data[0] = le32dec(sctx->job.version);
+		for (i = 0; i < 8; i++)
+			work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
+		for (i = 0; i < 8; i++)
+			work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
+		work->data[17] = le32dec(sctx->job.ntime);
+		work->data[18] = le32dec(sctx->job.nbits);
+		work->data[20] = 0x80000000;
+		work->data[31] = 0x00000280;
+	}
 
 	pthread_mutex_unlock(&sctx->work_lock);
 
 	if (opt_debug) {
 		char *xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-		applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=%s ntime=%08x",
-		       work->job_id, xnonce2str, swab32(work->data[17]));
+		applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=%s",
+		       work->job_id, xnonce2str);
 		free(xnonce2str);
 	}
 
 	if (opt_algo == ALGO_EQUIHASH)
-		diff_to_target(work->target, sctx->job.diff / 65536.0); //TODO equihash
+		diff_to_target(work->target, sctx->job.diff / 65536.0);
 	else
 		diff_to_target(work->target, sctx->job.diff);
 }
@@ -1515,6 +1561,7 @@ static bool stratum_handle_response(char *buf)
 	json_t *val, *err_val, *res_val, *id_val;
 	json_error_t err;
 	bool ret = false;
+	int id;
 
 	val = JSON_LOADS(buf, &err);
 	if (!val) {
@@ -1529,8 +1576,19 @@ static bool stratum_handle_response(char *buf)
 	if (!id_val || json_is_null(id_val) || !res_val)
 		goto out;
 
-	share_result(json_is_true(res_val),
-		err_val ? json_string_value(json_array_get(err_val, 1)) : NULL);
+	/* Get the response ID to determine what type of response this is */
+	id = (int)json_integer_value(id_val);
+	
+	/* Only call share_result for mining.submit responses (id:4)
+	 * id:1 = mining.subscribe, id:2 = mining.authorize, id:4 = mining.submit
+	 * Other IDs are ignored to prevent false rejection counts
+	 */
+	if (id == 4) {
+		share_result(json_is_true(res_val),
+			err_val ? json_string_value(json_array_get(err_val, 1)) : NULL);
+	} else if (opt_debug) {
+		applog(LOG_DEBUG, "Ignoring response for id:%d (not mining.submit)", id);
+	}
 
 	ret = true;
 out:

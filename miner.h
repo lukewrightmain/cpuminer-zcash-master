@@ -220,6 +220,9 @@ struct stratum_job {
 	unsigned char version[4];
 	unsigned char nbits[4];
 	unsigned char ntime[4];
+	unsigned char reserved[32];   /* ZCash hashReserved field */
+	unsigned char merkle_root[32]; /* ZCash merkle root */
+	bool is_zcash;                /* ZCash stratum format detected */
 	bool clean;
 	double diff;
 };
