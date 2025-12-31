@@ -1092,7 +1092,7 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 	char *s, *sret = NULL;
 	const char *sid, *xnonce1;
 	int xn2_size;
-	json_t *val = NULL, *res_val, *err_val;
+	json_t *val = NULL, *res_val, *err_val, *xn2_val;
 	json_error_t err;
 	bool ret = false, retry = false;
 
@@ -1165,11 +1165,11 @@ start:
 		goto out;
 	}
 	
-	xn2_size = json_integer_value(json_array_get(res_val, 2));
 	/* ZCash stratum: some pools (like 2miners) return extranonce2_size = 0
 	 * This means the pool doesn't use extranonce2 - we should respect this!
 	 * Only derive a fallback if xn2_size is not explicitly set in the response */
-	json_t *xn2_val = json_array_get(res_val, 2);
+	xn2_val = json_array_get(res_val, 2);
+	xn2_size = json_integer_value(xn2_val);
 	if (!xn2_val || json_is_null(xn2_val)) {
 		/* extranonce2_size not provided at all - derive it */
 		size_t nonce1_len = strlen(xnonce1) / 2;
