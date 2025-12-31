@@ -1166,25 +1166,26 @@ start:
 	}
 	
 	xn2_size = json_integer_value(json_array_get(res_val, 2));
-	if (!xn2_size) {
-		/* ZCash stratum: extranonce2_size is typically not provided
-		 * Calculate it based on nonce1 length.
-		 * ZCash uses 32-byte (256-bit) nonce total.
-		 * nonce1 is provided by pool, remaining is nonce2.
-		 * Standard: nonce1 is ~4 bytes, nonce2 is up to 28 bytes
-		 * But we typically use a smaller nonce2 for compatibility */
+	/* ZCash stratum: some pools (like 2miners) return extranonce2_size = 0
+	 * This means the pool doesn't use extranonce2 - we should respect this!
+	 * Only derive a fallback if xn2_size is not explicitly set in the response */
+	json_t *xn2_val = json_array_get(res_val, 2);
+	if (!xn2_val || json_is_null(xn2_val)) {
+		/* extranonce2_size not provided at all - derive it */
 		size_t nonce1_len = strlen(xnonce1) / 2;
 		if (nonce1_len > 0 && nonce1_len < 32) {
-			/* For ZCash Equihash, use remaining space up to a reasonable size */
 			xn2_size = 32 - nonce1_len;
-			if (xn2_size > 8) xn2_size = 8; /* Cap at 8 bytes for compatibility */
+			if (xn2_size > 8) xn2_size = 8;
 			applog(LOG_DEBUG, "ZCash stratum: derived extranonce2_size = %d (nonce1 = %zu bytes)", 
 				xn2_size, nonce1_len);
 		} else {
-			/* Default fallback for ZCash */
 			xn2_size = 4;
 			applog(LOG_DEBUG, "ZCash stratum: using default extranonce2_size = %d", xn2_size);
 		}
+	} else {
+		/* extranonce2_size explicitly set by pool (even if 0) - respect it */
+		xn2_size = json_integer_value(xn2_val);
+		applog(LOG_DEBUG, "ZCash stratum: pool set extranonce2_size = %d", xn2_size);
 	}
 	if (xn2_size < 0 || xn2_size > 100) {
 		applog(LOG_ERR, "Invalid value of extranonce2_size");
@@ -1358,9 +1359,17 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 			memset(sctx->job.reserved, 0, 32);
 		}
 		
-		/* Initialize xnonce2 for ZCash if not already done */
-		if (!sctx->job.xnonce2 && sctx->xnonce2_size > 0) {
-			sctx->job.xnonce2 = (unsigned char *)calloc(1, sctx->xnonce2_size);
+		/* Initialize xnonce2 for ZCash if not already done
+		 * Note: Some pools (like 2miners) use xnonce2_size = 0, so we check for that
+		 */
+		if (sctx->xnonce2_size > 0) {
+			if (!sctx->job.xnonce2) {
+				sctx->job.xnonce2 = (unsigned char *)calloc(1, sctx->xnonce2_size);
+			}
+		} else {
+			/* xnonce2_size = 0: pool doesn't use extranonce2 */
+			free(sctx->job.xnonce2);
+			sctx->job.xnonce2 = NULL;
 		}
 		
 		sctx->job.is_zcash = true;
@@ -1463,6 +1472,73 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 
 	if (opt_debug)
 		applog(LOG_DEBUG, "Stratum difficulty set to %g", diff);
+
+	return true;
+}
+
+/* Handle mining.set_target - used by some ZCash pools (like 2miners) instead of set_difficulty */
+static bool stratum_set_target(struct stratum_ctx *sctx, json_t *params)
+{
+	const char *target_hex;
+	double diff;
+
+	target_hex = json_string_value(json_array_get(params, 0));
+	if (!target_hex || strlen(target_hex) < 8)
+		return false;
+
+	/* Convert target to difficulty
+	 * The target is a 256-bit big-endian hex string
+	 * Difficulty = max_target / target
+	 * For ZCash, we can estimate from the leading zeros
+	 */
+	
+	/* Count leading zeros in the target to estimate difficulty */
+	int leading_zeros = 0;
+	for (int i = 0; target_hex[i]; i++) {
+		if (target_hex[i] == '0') {
+			leading_zeros++;
+		} else {
+			break;
+		}
+	}
+	
+	/* Parse the first non-zero bytes to get a more accurate difficulty */
+	unsigned long first_val = 0;
+	if (strlen(target_hex) >= (size_t)(leading_zeros + 4)) {
+		char tmp[9] = {0};
+		strncpy(tmp, target_hex + leading_zeros, 8);
+		first_val = strtoul(tmp, NULL, 16);
+	}
+	
+	/* Calculate approximate difficulty
+	 * Each leading zero hex char = 16x harder
+	 * For ZCash pools, difficulty is typically quite low for pool shares
+	 */
+	if (first_val > 0) {
+		/* More accurate calculation */
+		diff = (double)0xFFFFFFFFUL / (double)first_val;
+		for (int i = 0; i < leading_zeros; i++) {
+			diff *= 16.0;
+		}
+		/* Adjust for ZCash's different difficulty calculation */
+		diff /= 65536.0;
+	} else {
+		/* Fallback: rough estimate based on leading zeros */
+		diff = 1.0;
+		for (int i = 0; i < leading_zeros; i++) {
+			diff *= 16.0;
+		}
+	}
+	
+	/* Clamp to reasonable values */
+	if (diff < 0.001) diff = 0.001;
+	if (diff > 1e15) diff = 1e15;
+
+	pthread_mutex_lock(&sctx->work_lock);
+	sctx->next_diff = diff;
+	pthread_mutex_unlock(&sctx->work_lock);
+
+	applog(LOG_DEBUG, "Stratum target set: %s (estimated diff: %g)", target_hex, diff);
 
 	return true;
 }
@@ -1573,6 +1649,10 @@ bool stratum_handle_method(struct stratum_ctx *sctx, const char *s)
 	}
 	if (!strcasecmp(method, "mining.set_difficulty")) {
 		ret = stratum_set_difficulty(sctx, params);
+		goto out;
+	}
+	if (!strcasecmp(method, "mining.set_target")) {
+		ret = stratum_set_target(sctx, params);
 		goto out;
 	}
 	if (!strcasecmp(method, "client.reconnect")) {

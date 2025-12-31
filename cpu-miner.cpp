@@ -748,7 +748,13 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		}
 		bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
 		bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
-		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
+		
+		/* Handle empty extranonce2 (some pools like 2miners use xnonce2_size = 0) */
+		if (work->xnonce2_len > 0 && work->xnonce2) {
+			xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
+		} else {
+			xnonce2str = strdup("");  /* Empty string for pools that don't use extranonce2 */
+		}
 		
 		/* ZCash stratum requires the solution */
 		if (opt_algo == ALGO_EQUIHASH) {
@@ -1259,15 +1265,23 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	free(work->job_id);
 	work->job_id = strdup(sctx->job.job_id);
 	work->xnonce2_len = sctx->xnonce2_size;
-	work->xnonce2 = (unsigned char *)realloc(work->xnonce2, sctx->xnonce2_size);
-	if (sctx->job.xnonce2)
-		memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
-	else
-		memset(work->xnonce2, 0, sctx->xnonce2_size);
 	
-	/* Increment extranonce2 */
-	if (sctx->job.xnonce2) {
-		for (i = 0; i < (int)sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
+	/* Handle extranonce2 - some pools (like 2miners) set this to 0 */
+	if (sctx->xnonce2_size > 0) {
+		work->xnonce2 = (unsigned char *)realloc(work->xnonce2, sctx->xnonce2_size);
+		if (sctx->job.xnonce2)
+			memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
+		else
+			memset(work->xnonce2, 0, sctx->xnonce2_size);
+		
+		/* Increment extranonce2 */
+		if (sctx->job.xnonce2) {
+			for (i = 0; i < (int)sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
+		}
+	} else {
+		/* extranonce2_size = 0: pool doesn't use extranonce2 */
+		free(work->xnonce2);
+		work->xnonce2 = NULL;
 	}
 
 	/* Reset solution state for new work */
@@ -1347,10 +1361,15 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	pthread_mutex_unlock(&sctx->work_lock);
 
 	if (opt_debug) {
-		char *xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-		applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=%s",
-		       work->job_id, xnonce2str);
-		free(xnonce2str);
+		if (work->xnonce2_len > 0 && work->xnonce2) {
+			char *xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
+			applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=%s",
+			       work->job_id, xnonce2str);
+			free(xnonce2str);
+		} else {
+			applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=(none - pool uses 0 size)",
+			       work->job_id);
+		}
 	}
 
 	if (opt_algo == ALGO_EQUIHASH)
