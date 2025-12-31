@@ -159,6 +159,7 @@ bool have_stratum = false;
 bool use_syslog = false;
 static bool opt_background = false;
 static bool opt_quiet = false;
+static bool opt_no_solution_prefix = false; /* Don't add CompactSize prefix to solution */
 static int opt_retries = -1;
 static int opt_fail_pause = 30;
 int opt_timeout = 0;
@@ -226,6 +227,8 @@ Options:\n\
       --no-gbt          disable getblocktemplate support\n\
       --no-stratum      disable X-Stratum support\n\
       --no-redirect     ignore requests to change the URL of the mining server\n\
+      --no-solution-prefix  don't add CompactSize prefix to Equihash solution\n\
+                          (try this if shares are rejected with default settings)\n\
   -q, --quiet           disable per-thread hashmeter output\n\
   -D, --debug           enable debug output\n\
   -P, --protocol-dump   verbose dump of protocol-level activities\n"
@@ -262,6 +265,7 @@ static struct option const options[] = {
 	{ "cert", 1, NULL, 1001 },
 	{ "coinbase-addr", 1, NULL, 1013 },
 	{ "coinbase-sig", 1, NULL, 1015 },
+	{ "no-solution-prefix", 0, NULL, 1016 },
 	{ "config", 1, NULL, 'c' },
 	{ "debug", 0, NULL, 'D' },
 	{ "help", 0, NULL, 'h' },
@@ -679,16 +683,25 @@ static void share_result(int result, const char *reason)
 	pthread_mutex_unlock(&stats_lock);
 	
 	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-	applog(LOG_NOTICE, "%s " C_BRIGHT_GREEN "Share %s!" C_RESET " [" C_BRIGHT_CYAN "%lu" C_RESET "/" C_CYAN "%lu" C_RESET "] " C_BRIGHT_YELLOW "%.1f%%" C_RESET " @ " C_BRIGHT_MAGENTA "%s kH/s" C_RESET,
-		   result ? "✓" : "✗",
-		   result ? "accepted" : "rejected",
-		   accepted_count,
-		   accepted_count + rejected_count,
-		   100. * accepted_count / (accepted_count + rejected_count),
-		   s);
-
-	if (opt_debug && reason)
-		applog(LOG_DEBUG, "DEBUG: reject reason: %s", reason);
+	
+	if (result) {
+		applog(LOG_NOTICE, C_BRIGHT_GREEN "✓ Share accepted!" C_RESET " [" C_BRIGHT_CYAN "%lu" C_RESET "/" C_CYAN "%lu" C_RESET "] " C_BRIGHT_YELLOW "%.1f%%" C_RESET " @ " C_BRIGHT_MAGENTA "%s kH/s" C_RESET,
+			   accepted_count,
+			   accepted_count + rejected_count,
+			   100. * accepted_count / (accepted_count + rejected_count),
+			   s);
+	} else {
+		applog(LOG_WARNING, C_RED "✗ Share REJECTED!" C_RESET " [" C_BRIGHT_CYAN "%lu" C_RESET "/" C_CYAN "%lu" C_RESET "] " C_BRIGHT_YELLOW "%.1f%%" C_RESET " @ " C_BRIGHT_MAGENTA "%s kH/s" C_RESET,
+			   accepted_count,
+			   accepted_count + rejected_count,
+			   100. * accepted_count / (accepted_count + rejected_count),
+			   s);
+		/* Always show reject reason if available (important for debugging) */
+		if (reason)
+			applog(LOG_WARNING, C_YELLOW "   ⚠ Reject reason: %s" C_RESET, reason);
+		else
+			applog(LOG_WARNING, C_YELLOW "   ⚠ Reject reason: (not provided by pool)" C_RESET);
+	}
 }
 
 static bool submit_upstream_work(CURL *curl, struct work *work)
@@ -711,8 +724,28 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		char ntimestr[9], noncestr[9], *xnonce2str, *req;
 		char *solutionstr = NULL;
 
-		le32enc(&ntime, work->data[17]);
-		le32enc(&nonce, work->data[19]);
+		/* ZCash 140-byte header layout vs Bitcoin 80-byte header:
+		 * - Bitcoin: nTime at offset 68 = work->data[17]
+		 * - ZCash:   nTime at offset 100 = work->data[25]
+		 * 
+		 * ZCash header:
+		 *   0-3:     Version (4 bytes)    → work->data[0]
+		 *   4-35:    Prevhash (32 bytes)  → work->data[1-8]
+		 *   36-67:   MerkleRoot (32 bytes)→ work->data[9-16]
+		 *   68-99:   Reserved (32 bytes)  → work->data[17-24]
+		 *   100-103: nTime (4 bytes)      → work->data[25]
+		 *   104-107: nBits (4 bytes)      → work->data[26]
+		 *   108-139: nNonce (32 bytes)    → work->data[27-34]
+		 */
+		if (opt_algo == ALGO_EQUIHASH) {
+			/* ZCash: nTime at work->data[25] */
+			le32enc(&ntime, work->data[25]);
+			le32enc(&nonce, work->data[27]);
+		} else {
+			/* Bitcoin: nTime at work->data[17] */
+			le32enc(&ntime, work->data[17]);
+			le32enc(&nonce, work->data[19]);
+		}
 		bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
 		bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
 		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
@@ -726,20 +759,67 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 				goto out;
 			}
 			
-			solutionstr = abin2hex(work->solution, work->solution_len);
+			size_t total_solution_len;
+			
+			if (opt_no_solution_prefix) {
+				/* Some pools want raw solution without CompactSize prefix */
+				solutionstr = abin2hex(work->solution, work->solution_len);
+				total_solution_len = work->solution_len;
+				
+				applog(LOG_NOTICE, C_BRIGHT_CYAN "📤 Submitting share:" C_RESET " job=%s ntime=%s xnonce2=%s solution=%zu bytes (raw)",
+					work->job_id, ntimestr, xnonce2str, work->solution_len);
+			} else {
+				/* ZCash stratum protocol typically requires solution with CompactSize prefix.
+				 * For 1344 bytes: 0xfd (2-byte indicator) + 0x40 0x05 (1344 in LE)
+				 * Total = 3 + 1344 = 1347 bytes
+				 */
+				unsigned char solution_with_prefix[1347];
+				size_t prefix_len = 0;
+				
+				if (work->solution_len < 0xfd) {
+					/* 1-byte prefix for solutions < 253 bytes (not typical for Equihash 200,9) */
+					solution_with_prefix[0] = (unsigned char)work->solution_len;
+					prefix_len = 1;
+				} else if (work->solution_len <= 0xffff) {
+					/* 3-byte prefix for solutions < 65536 bytes */
+					solution_with_prefix[0] = 0xfd;
+					solution_with_prefix[1] = (unsigned char)(work->solution_len & 0xff);
+					solution_with_prefix[2] = (unsigned char)((work->solution_len >> 8) & 0xff);
+					prefix_len = 3;
+				} else {
+					/* 5-byte prefix for larger solutions (not typical) */
+					solution_with_prefix[0] = 0xfe;
+					solution_with_prefix[1] = (unsigned char)(work->solution_len & 0xff);
+					solution_with_prefix[2] = (unsigned char)((work->solution_len >> 8) & 0xff);
+					solution_with_prefix[3] = (unsigned char)((work->solution_len >> 16) & 0xff);
+					solution_with_prefix[4] = (unsigned char)((work->solution_len >> 24) & 0xff);
+					prefix_len = 5;
+				}
+				
+				/* Copy the actual solution after the prefix */
+				memcpy(solution_with_prefix + prefix_len, work->solution, work->solution_len);
+				total_solution_len = prefix_len + work->solution_len;
+				
+				solutionstr = abin2hex(solution_with_prefix, total_solution_len);
+				
+				applog(LOG_NOTICE, C_BRIGHT_CYAN "📤 Submitting share:" C_RESET " job=%s ntime=%s xnonce2=%s solution=%zu bytes (prefixed: %zu)",
+					work->job_id, ntimestr, xnonce2str, work->solution_len, total_solution_len);
+			}
 			
 			/* ZCash stratum format: ["worker", "job_id", "ntime", "extranonce2", "solution"] 
 			 * Note: For Equihash, the solution is the proof-of-work, not an iterated nonce.
-			 * We only send extranonce2 as the "nonce" field, not xnonce2+solving_nonce.
 			 */
 			req = (char *)malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 
-				2 * work->xnonce2_len + 2 * work->solution_len);
+				2 * work->xnonce2_len + 2 * total_solution_len);
 			sprintf(req,
 				"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
 				rpc_user, work->job_id, ntimestr, xnonce2str, solutionstr);
 			
-			applog(LOG_NOTICE, C_BRIGHT_CYAN "📤 Submitting share:" C_RESET " job=%s ntime=%s xnonce2=%s solution=%zu bytes",
-				work->job_id, ntimestr, xnonce2str, work->solution_len);
+			if (opt_debug) {
+				applog(LOG_DEBUG, "DEBUG: Submit params: worker=%s job=%s ntime=%s xnonce2=%s solution_len=%zu",
+					rpc_user, work->job_id, ntimestr, xnonce2str, total_solution_len);
+			}
+			
 			free(solutionstr);
 		} else {
 			/* Original Bitcoin-style stratum format */
@@ -1569,6 +1649,13 @@ static bool stratum_handle_response(char *buf)
 		goto out;
 	}
 
+	/* Debug: always log the full response for debugging */
+	if (opt_debug || opt_protocol) {
+		char *dump = json_dumps(val, JSON_COMPACT);
+		applog(LOG_DEBUG, "Stratum response: %s", dump);
+		free(dump);
+	}
+
 	res_val = json_object_get(val, "result");
 	err_val = json_object_get(val, "error");
 	id_val = json_object_get(val, "id");
@@ -1584,8 +1671,27 @@ static bool stratum_handle_response(char *buf)
 	 * Other IDs are ignored to prevent false rejection counts
 	 */
 	if (id == 4) {
-		share_result(json_is_true(res_val),
-			err_val ? json_string_value(json_array_get(err_val, 1)) : NULL);
+		const char *reason = NULL;
+		
+		/* Extract rejection reason from error field */
+		if (err_val && !json_is_null(err_val)) {
+			/* Error format can be: 
+			 * - [code, "message", null]
+			 * - {"code": x, "message": "..."}
+			 * - "simple string"
+			 */
+			if (json_is_array(err_val) && json_array_size(err_val) >= 2) {
+				json_t *msg = json_array_get(err_val, 1);
+				reason = json_is_string(msg) ? json_string_value(msg) : NULL;
+			} else if (json_is_object(err_val)) {
+				json_t *msg = json_object_get(err_val, "message");
+				reason = json_is_string(msg) ? json_string_value(msg) : NULL;
+			} else if (json_is_string(err_val)) {
+				reason = json_string_value(err_val);
+			}
+		}
+		
+		share_result(json_is_true(res_val), reason);
 	} else if (opt_debug) {
 		applog(LOG_DEBUG, "Ignoring response for id:%d (not mining.submit)", id);
 	}
@@ -1933,6 +2039,9 @@ static void parse_arg(int key, char *arg, char *pname)
 			show_usage_and_exit(1);
 		}
 		strcpy(coinbase_sig, arg);
+		break;
+	case 1016:			/* --no-solution-prefix */
+		opt_no_solution_prefix = true;
 		break;
 	case 'S':
 		use_syslog = true;
