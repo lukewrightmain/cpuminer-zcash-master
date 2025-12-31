@@ -239,6 +239,8 @@ struct stratum_ctx {
 	pthread_mutex_t sock_lock;
 
 	double next_diff;
+	uint32_t next_target[8];    /* 256-bit target from mining.set_target */
+	bool has_target;            /* True if target was set via mining.set_target */
 
 	char *session_id;
 	size_t xnonce1_size;

@@ -1165,23 +1165,15 @@ start:
 		goto out;
 	}
 	
-	/* ZCash stratum: some pools (like 2miners) return extranonce2_size = 0
-	 * This means the pool doesn't use extranonce2 - we should respect this!
-	 * Only derive a fallback if xn2_size is not explicitly set in the response */
+	/* ZCash stratum: some pools (like 2miners) don't send extranonce2_size at all
+	 * This means they don't use extranonce2 - we should use 0!
+	 * The nonce variation comes from the Equihash solver itself, not from extranonce2
+	 */
 	xn2_val = json_array_get(res_val, 2);
-	xn2_size = json_integer_value(xn2_val);
 	if (!xn2_val || json_is_null(xn2_val)) {
-		/* extranonce2_size not provided at all - derive it */
-		size_t nonce1_len = strlen(xnonce1) / 2;
-		if (nonce1_len > 0 && nonce1_len < 32) {
-			xn2_size = 32 - nonce1_len;
-			if (xn2_size > 8) xn2_size = 8;
-			applog(LOG_DEBUG, "ZCash stratum: derived extranonce2_size = %d (nonce1 = %zu bytes)", 
-				xn2_size, nonce1_len);
-		} else {
-			xn2_size = 4;
-			applog(LOG_DEBUG, "ZCash stratum: using default extranonce2_size = %d", xn2_size);
-		}
+		/* extranonce2_size not provided - ZCash pools typically don't use it */
+		xn2_size = 0;
+		applog(LOG_DEBUG, "ZCash stratum: extranonce2_size not provided, using 0 (pool doesn't use xn2)");
 	} else {
 		/* extranonce2_size explicitly set by pool (even if 0) - respect it */
 		xn2_size = json_integer_value(xn2_val);
@@ -1201,6 +1193,7 @@ start:
 	hex2bin(sctx->xnonce1, xnonce1, sctx->xnonce1_size);
 	sctx->xnonce2_size = xn2_size;
 	sctx->next_diff = 1.0;
+	sctx->has_target = false;  /* Will be set to true by mining.set_target */
 	pthread_mutex_unlock(&sctx->work_lock);
 
 	if (opt_debug && sid)
@@ -1480,65 +1473,46 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 static bool stratum_set_target(struct stratum_ctx *sctx, json_t *params)
 {
 	const char *target_hex;
-	double diff;
+	unsigned char target_bin[32];
 
 	target_hex = json_string_value(json_array_get(params, 0));
-	if (!target_hex || strlen(target_hex) < 8)
+	if (!target_hex || strlen(target_hex) != 64)
 		return false;
 
-	/* Convert target to difficulty
-	 * The target is a 256-bit big-endian hex string
-	 * Difficulty = max_target / target
-	 * For ZCash, we can estimate from the leading zeros
+	/* Parse the 256-bit target directly from hex
+	 * The hex string is big-endian, we need to store it for comparison
 	 */
-	
-	/* Count leading zeros in the target to estimate difficulty */
-	int leading_zeros = 0;
-	for (int i = 0; target_hex[i]; i++) {
-		if (target_hex[i] == '0') {
-			leading_zeros++;
-		} else {
-			break;
-		}
+	if (!hex2bin(target_bin, target_hex, 32)) {
+		applog(LOG_ERR, "Failed to parse target hex");
+		return false;
 	}
-	
-	/* Parse the first non-zero bytes to get a more accurate difficulty */
-	unsigned long first_val = 0;
-	if (strlen(target_hex) >= (size_t)(leading_zeros + 4)) {
-		char tmp[9] = {0};
-		strncpy(tmp, target_hex + leading_zeros, 8);
-		first_val = strtoul(tmp, NULL, 16);
-	}
-	
-	/* Calculate approximate difficulty
-	 * Each leading zero hex char = 16x harder
-	 * For ZCash pools, difficulty is typically quite low for pool shares
-	 */
-	if (first_val > 0) {
-		/* More accurate calculation */
-		diff = (double)0xFFFFFFFFUL / (double)first_val;
-		for (int i = 0; i < leading_zeros; i++) {
-			diff *= 16.0;
-		}
-		/* Adjust for ZCash's different difficulty calculation */
-		diff /= 65536.0;
-	} else {
-		/* Fallback: rough estimate based on leading zeros */
-		diff = 1.0;
-		for (int i = 0; i < leading_zeros; i++) {
-			diff *= 16.0;
-		}
-	}
-	
-	/* Clamp to reasonable values */
-	if (diff < 0.001) diff = 0.001;
-	if (diff > 1e15) diff = 1e15;
 
 	pthread_mutex_lock(&sctx->work_lock);
+	
+	/* Convert from big-endian bytes to uint32_t array for comparison
+	 * The fulltest function compares uint32_t[7] down to uint32_t[0]
+	 * where [7] is the most significant
+	 */
+	for (int i = 0; i < 8; i++) {
+		/* target_bin[0..3] is the most significant, should go to next_target[7] */
+		sctx->next_target[7 - i] = be32dec(&target_bin[i * 4]);
+	}
+	sctx->has_target = true;
+	
+	/* Also set a rough difficulty estimate for logging purposes */
+	int leading_zeros = 0;
+	for (int i = 0; target_hex[i] == '0'; i++) {
+		leading_zeros++;
+	}
+	double diff = 1.0;
+	for (int i = 0; i < leading_zeros; i++) {
+		diff *= 16.0;
+	}
 	sctx->next_diff = diff;
+	
 	pthread_mutex_unlock(&sctx->work_lock);
 
-	applog(LOG_DEBUG, "Stratum target set: %s (estimated diff: %g)", target_hex, diff);
+	applog(LOG_DEBUG, "Stratum target set: %s (estimated diff: %.0f)", target_hex, diff);
 
 	return true;
 }

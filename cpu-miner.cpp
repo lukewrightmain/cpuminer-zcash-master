@@ -1372,10 +1372,18 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		}
 	}
 
-	if (opt_algo == ALGO_EQUIHASH)
+	/* Set target for share validation */
+	if (sctx->has_target) {
+		/* Use target directly from mining.set_target (ZCash pools like 2miners) */
+		memcpy(work->target, sctx->next_target, sizeof(work->target));
+		if (opt_debug) {
+			applog(LOG_DEBUG, "Using direct target from pool (has_target=true)");
+		}
+	} else if (opt_algo == ALGO_EQUIHASH) {
 		diff_to_target(work->target, sctx->job.diff / 65536.0);
-	else
+	} else {
 		diff_to_target(work->target, sctx->job.diff);
+	}
 }
 
 static void *miner_thread(void *userdata)
