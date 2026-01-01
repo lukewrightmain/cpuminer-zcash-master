@@ -103,57 +103,22 @@ pkg install -y \
     libsodium \
     clang \
     make \
-    pkg-config
+    pkg-config \
+    binutils \
+    build-essential
 
 print_success "Dependencies installed!"
 
-# Step 3: Build jansson from source
-print_step "Step 3/6: Installing jansson"
+# Step 3: Check jansson
+print_step "Step 3/6: Checking jansson"
 
 # First try to install jansson from pkg (might work on newer Termux)
 print_info "Attempting to install jansson via pkg..."
 if pkg install -y jansson 2>/dev/null; then
-    # Verify it actually works
-    if pkg-config --exists jansson 2>/dev/null; then
-        print_success "jansson installed via pkg!"
-    else
-        print_info "pkg jansson didn't work properly, building from source..."
-        BUILD_JANSSON=1
-    fi
+    print_success "jansson installed via pkg!"
 else
-    print_info "jansson not available via pkg, building from source..."
-    BUILD_JANSSON=1
-fi
-
-if [ "$BUILD_JANSSON" = "1" ]; then
-    # Check if jansson directory exists
-    if [ ! -d "jansson" ]; then
-        print_info "Cloning jansson..."
-        git clone https://github.com/akheron/jansson.git jansson
-    fi
-
-    cd jansson
-
-    # Clean any previous build
-    if [ -f "Makefile" ]; then
-        print_info "Cleaning previous jansson build..."
-        make clean 2>/dev/null || true
-    fi
-
-    print_info "Running autoreconf..."
-    autoreconf -i
-
-    print_info "Configuring jansson..."
-    ./configure --prefix=$PREFIX
-
-    print_info "Building jansson..."
-    make -j$(nproc)
-
-    print_info "Installing jansson..."
-    make install
-
-    cd "$SCRIPT_DIR"
-    print_success "jansson built and installed from source!"
+    print_info "jansson not available via pkg - will use in-tree version from compat/jansson"
+    print_success "Using bundled jansson from compat/jansson"
 fi
 
 # Step 4: Generate configure script
